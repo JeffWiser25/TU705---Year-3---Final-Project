@@ -1,0 +1,607 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : PI/PID motor speed control with TIM3 PWM + TCRT5000 pulse input
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdlib.h>
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+typedef enum
+{
+  LOOP_OPEN = 0,
+  LOOP_CLOSED = 1
+} LoopMode_t;
+
+typedef enum
+{
+  CTRL_PI = 0,
+  CTRL_PID = 1
+} ControlMode_t;
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+#define PWM_MAX_COUNTS         6799.0f
+#define PWM_SAFE_MAX_COUNTS    5799.0f
+#define PWM_ACTIVE_LOW         1
+
+#define CONTROL_PERIOD_MS      20U
+#define STATUS_PERIOD_MS       200U
+#define RPM_SAMPLE_MS          100U
+
+#define UART_RX_BUF_LEN        64
+#define UART_TX_BUF_LEN        160
+
+#define INTEGRAL_LIMIT         3000.0f
+#define PULSES_PER_REV         1.0f
+
+#define RPM_SETPOINT_MIN       0.0f
+#define RPM_SETPOINT_MAX       2400.0f
+
+#define PWM_SLEW_STEP          200.0f
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+#define CLAMP(x, lo, hi) (((x) < (lo)) ? (lo) : (((x) > (hi)) ? (hi) : (x)))
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+TIM_HandleTypeDef htim3;
+UART_HandleTypeDef huart2;
+
+/* USER CODE BEGIN PV */
+volatile uint32_t pwm_value = 0;
+
+/* Pulse / RPM */
+volatile uint8_t sensor_state = 0;
+volatile uint8_t last_sensor_state = 0;
+volatile uint32_t pulse_count = 0;
+volatile float rpm = 0.0f;
+
+/* Control */
+float setpoint = 1000.0f;
+float feedback = 0.0f;
+float error = 0.0f;
+float prev_error = 0.0f;
+float prev_feedback = 0.0f;
+float integral = 0.0f;
+float derivative = 0.0f;
+float control_output = 0.0f;
+
+float Kp = 0.20f;
+float Ki = 0.08f;
+float Kd = 0.00f;
+
+LoopMode_t loop_mode = LOOP_OPEN;
+ControlMode_t control_mode = CTRL_PI;
+uint8_t control_enabled = 0;
+uint32_t manual_pwm = 1000;
+
+uint32_t last_control_tick = 0;
+uint32_t last_status_tick = 0;
+uint32_t last_rpm_tick = 0;
+
+uint8_t rx_char = 0;
+char rx_buffer[UART_RX_BUF_LEN];
+uint8_t rx_index = 0;
+char tx_buffer[UART_TX_BUF_LEN];
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_TIM3_Init(void);
+static void MX_USART2_UART_Init(void);
+
+/* USER CODE BEGIN PFP */
+static void UART_Send(const char *msg);
+static void UART_ProcessRx(void);
+static void Process_Command(char *cmd);
+static void Update_Pulse_Count(void);
+static void Update_RPM(void);
+static void Control_Loop(void);
+static void Send_Status(void);
+static void Apply_PWM(uint32_t value);
+static void Reset_Controller(void);
+static uint32_t Slew_Limit_PWM(float target);
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+static void UART_Send(const char *msg)
+{
+  HAL_UART_Transmit(&huart2, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
+}
+
+static void Reset_Controller(void)
+{
+  integral = 0.0f;
+  prev_error = 0.0f;
+  prev_feedback = rpm;
+  derivative = 0.0f;
+  control_output = 0.0f;
+}
+
+static uint32_t Slew_Limit_PWM(float target)
+{
+  static float current = 0.0f;
+  float delta = target - current;
+
+  if (delta > PWM_SLEW_STEP)
+  {
+    delta = PWM_SLEW_STEP;
+  }
+  else if (delta < -PWM_SLEW_STEP)
+  {
+    delta = -PWM_SLEW_STEP;
+  }
+
+  current += delta;
+  current = CLAMP(current, 0.0f, PWM_SAFE_MAX_COUNTS);
+
+  return (uint32_t)current;
+}
+
+static void Apply_PWM(uint32_t value)
+{
+  uint32_t applied;
+
+  if (value > (uint32_t)PWM_SAFE_MAX_COUNTS)
+  {
+    value = (uint32_t)PWM_SAFE_MAX_COUNTS;
+  }
+
+  pwm_value = value;
+
+#if PWM_ACTIVE_LOW
+  applied = (uint32_t)PWM_MAX_COUNTS - pwm_value;
+#else
+  applied = pwm_value;
+#endif
+
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, applied);
+}
+
+static void Update_Pulse_Count(void)
+{
+  /* PA0 / A0 used as digital pulse input from TCRT5000 digital OUT */
+  sensor_state = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0);
+
+  /* Rising edge count */
+  if ((sensor_state == GPIO_PIN_SET) && (last_sensor_state == GPIO_PIN_RESET))
+  {
+    pulse_count++;
+  }
+
+  last_sensor_state = sensor_state;
+}
+
+static void Update_RPM(void)
+{
+  if ((HAL_GetTick() - last_rpm_tick) >= RPM_SAMPLE_MS)
+  {
+    rpm = ((float)pulse_count * 60000.0f) / ((float)RPM_SAMPLE_MS * PULSES_PER_REV);
+    pulse_count = 0;
+    last_rpm_tick = HAL_GetTick();
+  }
+}
+
+static void Send_Status(void)
+{
+  int32_t kp_int = (int32_t)(Kp * 1000.0f);
+  int32_t ki_int = (int32_t)(Ki * 1000.0f);
+  int32_t kd_int = (int32_t)(Kd * 1000.0f);
+
+  const char *ctrl_text;
+  if (loop_mode == LOOP_OPEN)
+    ctrl_text = "OPEN";
+  else
+    ctrl_text = (control_mode == CTRL_PI) ? "PI" : "PID";
+
+  snprintf(tx_buffer, sizeof(tx_buffer),
+           "DATA,%ld,%ld,%ld,%lu,%ld,%ld,%ld,%s,%u\r\n",
+           (int32_t)setpoint,
+           (int32_t)rpm,
+           (int32_t)error,
+           pwm_value,
+           kp_int,
+           ki_int,
+           kd_int,
+           ctrl_text,
+           control_enabled);
+
+  UART_Send(tx_buffer);
+}
+
+static void Process_Command(char *cmd)
+{
+  if (strncmp(cmd, "START", 5) == 0)
+  {
+    control_enabled = 1;
+    Reset_Controller();
+    UART_Send("OK START\r\n");
+  }
+  else if (strncmp(cmd, "STOP", 4) == 0)
+  {
+    control_enabled = 0;
+    Reset_Controller();
+    Apply_PWM(0);
+    UART_Send("OK STOP\r\n");
+  }
+  else if (strncmp(cmd, "OPEN", 4) == 0)
+  {
+    loop_mode = LOOP_OPEN;
+    Reset_Controller();
+    UART_Send("OK OPEN\r\n");
+  }
+  else if (strncmp(cmd, "CLOSED", 6) == 0)
+  {
+    loop_mode = LOOP_CLOSED;
+    Reset_Controller();
+    UART_Send("OK CLOSED\r\n");
+  }
+  else if (strncmp(cmd, "MODE PI", 7) == 0)
+  {
+    control_mode = CTRL_PI;
+    Reset_Controller();
+    UART_Send("OK MODE PI\r\n");
+  }
+  else if (strncmp(cmd, "MODE PID", 8) == 0)
+  {
+    control_mode = CTRL_PID;
+    Reset_Controller();
+    UART_Send("OK MODE PID\r\n");
+  }
+  else if (strncmp(cmd, "SP ", 3) == 0)
+  {
+    setpoint = (float)atof(&cmd[3]);
+    setpoint = CLAMP(setpoint, RPM_SETPOINT_MIN, RPM_SETPOINT_MAX);
+    Reset_Controller();
+    UART_Send("OK SP\r\n");
+  }
+  else if (strncmp(cmd, "PWM ", 4) == 0)
+  {
+    manual_pwm = (uint32_t)atoi(&cmd[4]);
+    if (manual_pwm > (uint32_t)PWM_SAFE_MAX_COUNTS)
+    {
+      manual_pwm = (uint32_t)PWM_SAFE_MAX_COUNTS;
+    }
+    UART_Send("OK PWM\r\n");
+  }
+  else if (strncmp(cmd, "KP ", 3) == 0)
+  {
+    Kp = (float)atof(&cmd[3]);
+    Reset_Controller();
+    UART_Send("OK KP\r\n");
+  }
+  else if (strncmp(cmd, "KI ", 3) == 0)
+  {
+    Ki = (float)atof(&cmd[3]);
+    Reset_Controller();
+    UART_Send("OK KI\r\n");
+  }
+  else if (strncmp(cmd, "KD ", 3) == 0)
+  {
+    Kd = (float)atof(&cmd[3]);
+    Reset_Controller();
+    UART_Send("OK KD\r\n");
+  }
+  else if (strncmp(cmd, "STATUS", 6) == 0)
+  {
+    Send_Status();
+  }
+  else if (strncmp(cmd, "HELP", 4) == 0)
+  {
+    UART_Send("Commands:\r\n");
+    UART_Send("START\r\nSTOP\r\nOPEN\r\nCLOSED\r\nMODE PI\r\nMODE PID\r\n");
+    UART_Send("SP <0-2400>\r\nPWM <0-5799>\r\n");
+    UART_Send("KP <value>\r\nKI <value>\r\nKD <value>\r\n");
+    UART_Send("STATUS\r\nHELP\r\n");
+  }
+  else
+  {
+    UART_Send("ERR UNKNOWN CMD\r\n");
+  }
+}
+
+static void UART_ProcessRx(void)
+{
+  if (HAL_UART_Receive(&huart2, &rx_char, 1, 0) == HAL_OK)
+  {
+    if ((rx_char == '\r') || (rx_char == '\n'))
+    {
+      if (rx_index > 0)
+      {
+        rx_buffer[rx_index] = '\0';
+        Process_Command(rx_buffer);
+        rx_index = 0;
+        memset(rx_buffer, 0, sizeof(rx_buffer));
+      }
+    }
+    else
+    {
+      if (rx_index < (UART_RX_BUF_LEN - 1))
+      {
+        rx_buffer[rx_index++] = (char)rx_char;
+      }
+    }
+  }
+}
+
+static void Control_Loop(void)
+{
+  const float dt = (float)CONTROL_PERIOD_MS / 1000.0f;
+  float proposed_integral;
+  float u;
+
+  feedback = rpm;
+  error = setpoint - feedback;
+
+  if (!control_enabled)
+  {
+    Reset_Controller();
+    Apply_PWM(0);
+    return;
+  }
+
+  if (loop_mode == LOOP_OPEN)
+  {
+    Apply_PWM(Slew_Limit_PWM((float)manual_pwm));
+    return;
+  }
+
+  proposed_integral = integral + (error * dt);
+  proposed_integral = CLAMP(proposed_integral, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
+
+  derivative = (error - prev_error) / dt;
+
+  u = (Kp * error) + (Ki * proposed_integral);
+
+  if (control_mode == CTRL_PID)
+  {
+    u += (Kd * derivative);
+  }
+
+  if (u > PWM_SAFE_MAX_COUNTS)
+  {
+    u = PWM_SAFE_MAX_COUNTS;
+  }
+  else if (u < 0.0f)
+  {
+    u = 0.0f;
+  }
+  else
+  {
+    integral = proposed_integral;
+  }
+
+  control_output = u;
+
+  Apply_PWM(Slew_Limit_PWM(control_output));
+
+  prev_error = error;
+  prev_feedback = feedback;
+}
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+  HAL_Init();
+  SystemClock_Config();
+
+  MX_GPIO_Init();
+  MX_TIM3_Init();
+  MX_USART2_UART_Init();
+
+  if (HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  Apply_PWM(0);
+
+  UART_Send("\r\nPI/PID Speed Control Ready\r\n");
+  UART_Send("Feedback: TCRT5000 digital pulses on PA0/A0\r\n");
+  UART_Send("PWM: TIM3 CH1 at 25 kHz\r\n");
+  UART_Send("PWM output configured active-low for BTS7960\r\n");
+  UART_Send("Type HELP for commands\r\n");
+
+  last_control_tick = HAL_GetTick();
+  last_status_tick = HAL_GetTick();
+  last_rpm_tick = HAL_GetTick();
+
+  while (1)
+  {
+    UART_ProcessRx();
+    Update_Pulse_Count();
+    Update_RPM();
+
+    if ((HAL_GetTick() - last_control_tick) >= CONTROL_PERIOD_MS)
+    {
+      last_control_tick = HAL_GetTick();
+      Control_Loop();
+    }
+
+    if ((HAL_GetTick() - last_status_tick) >= STATUS_PERIOD_MS)
+    {
+      last_status_tick = HAL_GetTick();
+      Send_Status();
+    }
+  }
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1_BOOST);
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV4;
+  RCC_OscInitStruct.PLL.PLLN = 85;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
+  RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+                              | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 0;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 6799;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  HAL_TIM_MspPostInit(&htim3);
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart2.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart2, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart2, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOF_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  GPIO_InitStruct.Pin = GPIO_PIN_0;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+}
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1)
+  {
+  }
+}
+
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  (void)file;
+  (void)line;
+}
+#endif /* USE_FULL_ASSERT */
